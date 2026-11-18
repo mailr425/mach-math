@@ -7,6 +7,9 @@ A fast 2D platformer for practicing division with remainders.
 2. Open Godot. In the Project Manager, click **Import**, pick the `project.godot` file in this folder, then click **Import & Edit**.
 3. Press **F5** (or the ▶ Play button at the top right) to play.
 
+## Keep it synced with GitHub
+Double-click `autosync.bat` and leave its window open. It pulls new changes from GitHub every 60 seconds, and closing the window stops it. It only fast-forwards, so it never overwrites edits you haven't pushed.
+
 ## How to play
 - Move with **A/D** or the **arrow keys**. Jump with **Space**. Pick a door with **E** (or Down/S). Press **R** to restart. A controller also works: A to jump, X to pick a door.
 - **Run** between gates: hop the hurdles and grab gems. Right answers build your combo, and a bigger combo lets you run faster.
