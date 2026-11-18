@@ -25,6 +25,14 @@ const DOOR_SPACING := 120.0
 const BARRIER_OFFSET := 240.0   # how far past the middle door the wall sits
 const ZONE_REACH := 400.0       # how far before the doors the "thinking zone" starts
 
+const ENEMY_SIZE := Vector2(40, 32)
+const ENEMY_COLOR := Color(0.3, 0.75, 0.35)
+const MACH_SPEED := 480.0        # run at least this fast to plow through enemies
+const STOMP_POINTS := 50         # x chain: 50, 100, 150... for stomps without landing
+const MACH_POINTS := 75
+const STOMP_BOUNCE := -520.0
+const STOMP_BOUNCE_HELD := -720.0
+
 const DOOR_COLOR := Color(0.35, 0.3, 0.6)
 const DOOR_HOVER_COLOR := Color(0.55, 0.5, 0.95)
 const RIGHT_COLOR := Color(0.2, 0.8, 0.35)
@@ -44,6 +52,10 @@ const MISTAKE_NAMES := {
 var player
 var stations: Array = []
 var gems: Array = []           # Each: {"node", "pos", "taken"}
+var enemies: Array = []        # Each: {"node", "x", "min_x", "max_x", "dir", "speed", "alive"}
+var stomp_chain := 0
+var enemies_defeated := 0
+var prev_feet_y := 0.0
 var level_end_x := 0.0
 var clock := 0.0
 
@@ -134,8 +146,9 @@ func _build_world() -> void:
 	_add_block(Rect2(-100, FLOOR_Y - 900, 100, 900), Color(0.3, 0.3, 0.35))
 	_add_block(Rect2(level_end_x + 300, FLOOR_Y - 900, 100, 900), Color(0.3, 0.3, 0.35))
 
-	# Running sections: hurdles with gems
+	# Running sections: hurdles, gems and enemies (kept away from the gates)
 	_add_hurdle(650.0)
+	_add_enemy(720.0, 980.0)
 	for i in STATION_COUNT:
 		var x := FIRST_STATION_X + i * STATION_SPACING
 		stations.append(_build_station(x))
@@ -144,6 +157,10 @@ func _build_world() -> void:
 			_add_hurdle(x + 1000.0)
 			for g in 3:
 				_add_gem(Vector2(x + 720.0 + g * 60.0, FLOOR_Y - 40.0))
+			_add_enemy(x + 610.0, x + 960.0)
+			_add_enemy(x + 1060.0, x + 1350.0)
+		else:
+			_add_enemy(x + 610.0, x + 1050.0)
 
 	_add_rect(Rect2(level_end_x, FLOOR_Y - 300, 12, 300), Color.WHITE)
 	_add_rect(Rect2(level_end_x + 12, FLOOR_Y - 300, 90, 60), Color(1, 0.85, 0.1))
@@ -166,6 +183,113 @@ func _add_gem(pos: Vector2) -> void:
 	gem.color = Color(1, 0.9, 0.2)
 	add_child(gem)
 	gems.append({"node": gem, "pos": pos, "taken": false})
+
+
+## A harmless blob that patrols back and forth. It never hurts you.
+func _add_enemy(min_x: float, max_x: float) -> void:
+	var node := Node2D.new()
+	var body := ColorRect.new()
+	body.size = ENEMY_SIZE
+	body.position = Vector2(-ENEMY_SIZE.x / 2, -ENEMY_SIZE.y)  # origin at the feet
+	body.color = ENEMY_COLOR
+	node.add_child(body)
+	for ex in [-12.0, 4.0]:
+		var eye := ColorRect.new()
+		eye.size = Vector2(8, 10)
+		eye.position = Vector2(ex, -26)
+		eye.color = Color.WHITE
+		node.add_child(eye)
+		var pupil := ColorRect.new()
+		pupil.size = Vector2(4, 5)
+		pupil.position = Vector2(ex + 2, -22)
+		pupil.color = Color.BLACK
+		node.add_child(pupil)
+	add_child(node)
+	var e := {"node": node, "min_x": min_x, "max_x": max_x, "x": 0.0, "dir": 1.0,
+		"speed": 0.0, "alive": true}
+	_reset_enemy(e)
+	enemies.append(e)
+
+
+func _reset_enemy(e: Dictionary) -> void:
+	e["x"] = randf_range(e["min_x"], e["max_x"])
+	e["dir"] = 1.0 if randf() < 0.5 else -1.0
+	e["speed"] = randf_range(50.0, 90.0)
+	e["alive"] = true
+	var node: Node2D = e["node"]
+	node.position = Vector2(e["x"], FLOOR_Y)
+	node.scale = Vector2.ONE
+	node.modulate = Color.WHITE
+	node.visible = true
+
+
+func _update_enemies(delta: float) -> void:
+	var p: Vector2 = player.global_position
+	var feet_y := p.y + 24.0
+	var on_floor: bool = player.is_on_floor()
+	if on_floor:
+		stomp_chain = 0
+
+	for e in enemies:
+		if not e["alive"]:
+			continue
+		# Patrol
+		e["x"] += e["dir"] * e["speed"] * delta
+		if e["x"] < e["min_x"] or e["x"] > e["max_x"]:
+			e["dir"] *= -1.0
+			e["x"] = clampf(e["x"], e["min_x"], e["max_x"])
+		e["node"].position.x = e["x"]
+
+		# Touching the player? (player box is 32 x 48, centered)
+		var ex: float = e["x"]
+		var top := FLOOR_Y - ENEMY_SIZE.y
+		var overlap_x := absf(p.x - ex) < (16.0 + ENEMY_SIZE.x / 2)
+		var overlap_y := feet_y > top and p.y - 24.0 < FLOOR_Y
+		if not (overlap_x and overlap_y):
+			continue
+
+		var vel: Vector2 = player.velocity
+		if vel.y > 0.0 and prev_feet_y <= top + 12.0:
+			# Stomp! Bounce higher if jump is held.
+			stomp_chain += 1
+			var pts := STOMP_POINTS * stomp_chain
+			player.velocity.y = STOMP_BOUNCE_HELD if Input.is_action_pressed("jump") else STOMP_BOUNCE
+			_defeat_enemy(e, pts, "+%d" % pts if stomp_chain == 1 else "+%d  x%d!" % [pts, stomp_chain])
+		elif absf(vel.x) >= MACH_SPEED:
+			_defeat_enemy(e, MACH_POINTS, "MACH! +%d" % MACH_POINTS)
+		else:
+			# Harmless bump: the enemy just turns around.
+			e["dir"] = signf(ex - p.x) if ex != p.x else -e["dir"]
+
+	prev_feet_y = feet_y
+
+
+func _defeat_enemy(e: Dictionary, points: int, text: String) -> void:
+	e["alive"] = false
+	score += points
+	enemies_defeated += 1
+	var node: Node2D = e["node"]
+	var tw := create_tween()
+	tw.tween_property(node, "scale", Vector2(1.3, 0.25), 0.08)
+	tw.tween_property(node, "modulate:a", 0.0, 0.3)
+	tw.tween_callback(func(): node.visible = false)
+	_popup_text(text, Vector2(e["x"], FLOOR_Y - 70.0))
+
+
+## Floating score text that rises and fades.
+func _popup_text(text: String, pos: Vector2) -> void:
+	var lbl := Label.new()
+	lbl.text = text
+	lbl.size = Vector2(200, 40)
+	lbl.position = pos - Vector2(100, 20)
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_style_label(lbl, 28)
+	lbl.add_theme_color_override("font_color", Color(1, 0.9, 0.3))
+	add_child(lbl)
+	var tw := create_tween().set_parallel(true)
+	tw.tween_property(lbl, "position:y", lbl.position.y - 60.0, 0.8)
+	tw.tween_property(lbl, "modulate:a", 0.0, 0.8).set_delay(0.3)
+	tw.chain().tween_callback(lbl.queue_free)
 
 
 func _build_station(x: float) -> Dictionary:
@@ -351,6 +475,7 @@ func _physics_process(delta: float) -> void:
 	clock += delta
 
 	_collect_gems()
+	_update_enemies(delta)
 	var zone_station = _zone_station()
 	if zone_station != null and zone_station["arrived"] < 0.0:
 		zone_station["arrived"] = clock
@@ -504,6 +629,8 @@ func _start_escape() -> void:
 	for st in stations:
 		_assign_problem(st, 0)  # quicker problems for the race back
 		st["barrier"] = _make_barrier(st["x"] - BARRIER_OFFSET)
+	for e in enemies:
+		_reset_enemy(e)  # fresh enemies for the race back
 	_show_feedback("MATH TIME!  Race back to the START!\nThe clock stops while you're at a gate, so take your time on the math.", 5.0)
 
 
@@ -538,6 +665,7 @@ func _finish(escaped: bool) -> void:
 	lines.append("RANK: %s" % rank)
 	lines.append("Score: %d   (time bonus %d)" % [score, time_bonus])
 	lines.append("Right on the first try: %d / %d    Best combo: x%d" % [first_try_correct, answered, best_combo])
+	lines.append("Enemies defeated: %d" % enemies_defeated)
 	if mistakes.size() > 0:
 		lines.append("")
 		lines.append("Things to practice:")

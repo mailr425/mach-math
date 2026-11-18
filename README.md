@@ -13,6 +13,10 @@ Double-click `autosync.bat` and leave its window open. It pulls new changes from
 ## How to play
 - Move with **A/D** or the **arrow keys**. Jump with **Space**. Pick a door with **E** (or Down/S). Press **R** to restart. A controller also works: A to jump, X to pick a door.
 - **Run** between gates: hop the hurdles and grab gems. Right answers build your combo, and a bigger combo lets you run faster.
+- **Enemies** patrol between gates. They never hurt you, and beating them gives points:
+  - **Stomp** one by landing on its head. Hold jump to bounce higher. Stomping several in a row without landing is worth more each time (+50, +100, +150...).
+  - **Mach run** through one: with a combo going, run at top speed straight into it. Right answers on the first try are what make you fast enough.
+  - Bumping into one at normal speed is harmless; it just turns around. Enemies come back for Math Time.
 - **Think** at gates: a wall blocks the way, and three doors show answers. Walk up to a door and press E to pick it. There's no timer while you think.
   - First wrong pick: a hint (without the answer). Try another door.
   - Second wrong pick: the full work is shown and the right door turns gold.
