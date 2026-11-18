@@ -1,46 +1,26 @@
 extends Node2D
-## Mach Math
+## Mach Math: runs the whole game.
 ##
-## RUN between gates: hurdles, gems, and speed. Your combo makes you faster.
-## THINK at gates: a wall blocks the way. Three doors show answers.
-##   Walk up to a door and press E (or Down / S) to pick it. No timer while you think.
-##   A wrong pick gives a hint. A second wrong pick shows the work and lights up the right door.
-##   You always finish by picking the right answer, which opens the wall.
-## MATH TIME: reach the GOAL, then race back to START. The clock only counts
-##   running and stops while you're at a gate.
+## A RUN is 3 STAGES, each in a random environment (see biomes.gd), with a
+## CRAFTING TABLE before each one. Each stage has 3 math gates.
+##   RUN between gates: hurdles, gems, enemies, trees, ore, hazards.
+##   THINK at gates: walk up to a door and press E. No timer while you think.
+##     First miss = a hint. Second miss = the work is shown and the right door turns gold.
+## After stage 3, MATH TIME: race back to the start. The clock stops at gates.
+## Hazards cost a heart (armor shields go first). Out of hearts = restart the stage.
 
-const PlayerScript := preload("res://scripts/player.gd")
+const StageScript := preload("res://scripts/stage.gd")
 
-const FLOOR_Y := 600.0
-const STATION_COUNT := 6
-const STATION_SPACING := 1800.0
-const FIRST_STATION_X := 1400.0
-const START_X := 150.0
-const ESCAPE_TIME := 60.0
+const STAGES_PER_RUN := 3
+const ESCAPE_TIME := 45.0
 const QUICK_BONUS_SECONDS := 10.0
+const MAX_HP := 6            # in half-hearts, so 3 hearts
+const HAZARD_DAMAGE := 2     # one heart
 
-const DOOR_WIDTH := 96.0
-const DOOR_HEIGHT := 120.0
-const DOOR_SPACING := 120.0
-const BARRIER_OFFSET := 240.0   # how far past the middle door the wall sits
-const ZONE_REACH := 400.0       # how far before the doors the "thinking zone" starts
-
-const ENEMY_SIZE := Vector2(40, 32)
-const ENEMY_COLOR := Color(0.3, 0.75, 0.35)
-const MACH_SPEED := 480.0        # run at least this fast to plow through enemies
-const STOMP_POINTS := 50         # x chain: 50, 100, 150... for stomps without landing
-const MACH_POINTS := 75
-const STOMP_BOUNCE := -520.0
-const STOMP_BOUNCE_HELD := -720.0
-
-const DOOR_COLOR := Color(0.35, 0.3, 0.6)
 const DOOR_HOVER_COLOR := Color(0.55, 0.5, 0.95)
 const RIGHT_COLOR := Color(0.2, 0.8, 0.35)
 const WRONG_COLOR := Color(0.75, 0.2, 0.2)
 const REVEAL_COLOR := Color(0.95, 0.75, 0.1)
-const BARRIER_COLOR := Color(0.55, 0.15, 0.2)
-const NORMAL_SKY := Color(0.45, 0.7, 0.95)
-const ESCAPE_SKY := Color(0.85, 0.4, 0.3)
 
 const MISTAKE_NAMES := {
 	"remainder_too_big": "Remainder bigger than the divisor",
@@ -49,14 +29,11 @@ const MISTAKE_NAMES := {
 	"wrong_remainder": "Wrong remainder",
 }
 
-var player
-var stations: Array = []
-var gems: Array = []           # Each: {"node", "pos", "taken"}
-var enemies: Array = []        # Each: {"node", "x", "min_x", "max_x", "dir", "speed", "alive"}
-var stomp_chain := 0
-var enemies_defeated := 0
-var prev_feet_y := 0.0
-var level_end_x := 0.0
+var inventory := Inventory.new()
+var stage = null
+var run_biomes: Array = []
+var stage_index := 0
+var state := "crafting"   # crafting, playing, escape, transition, results
 var clock := 0.0
 
 # Adaptive difficulty: 3 first-try rights in a row = harder, 2 misses in a row = easier
@@ -70,46 +47,74 @@ var score := 0
 var answered := 0
 var first_try_correct := 0
 var mistakes := {}
-var escaping := false
+var enemies_defeated := 0
+var run_mats := {"wood": 0, "stone": 0, "iron": 0, "diamond": 0}
 var escape_left := 0.0
-var finished := false
 
+var hp := MAX_HP
+var shield := 0
+var shield_max := 0
+var invuln := 0.0
+
+# HUD
 var problem_label: Label
 var stats_label: Label
 var timer_label: Label
 var feedback_label: Label
 var feedback_bg: ColorRect
 var prompt_label: Label
+var inv_label: Label
+var help_label: Label
+var hearts_box: HBoxContainer
 var results_label: Label
 var results_bg: ColorRect
 var door_marker: ColorRect
 var feedback_left := 0.0   # < 0 means it stays until the gate is solved
 
+# Crafting screen
+var craft_root: ColorRect
+var craft_next: Label
+var craft_inv: Label
+var craft_gear: Label
+var craft_grid: GridContainer
+var craft_desc: Label
+var start_btn: Button
+
 
 func _ready() -> void:
 	randomize()
 	_setup_input()
-	RenderingServer.set_default_clear_color(NORMAL_SKY)
-	_build_world()
+	inventory.load_save()
+	var ids := Biomes.ids()
+	ids.shuffle()
+	run_biomes = ids.slice(0, STAGES_PER_RUN)
 	_build_hud()
-	_spawn_player()
-	for st in stations:
-		_assign_problem(st, level)
-	_show_feedback("Run to the gate, then walk up to a door and press E to pick an answer!", 5.0)
+	_show_crafting()
 
 
-# ---------------------------------------------------------------- input
+func is_playing() -> bool:
+	return state == "playing" or state == "escape"
+
+
+# ================================================================ input
 
 func _setup_input() -> void:
 	_add_keys("move_left", [KEY_A, KEY_LEFT])
 	_add_keys("move_right", [KEY_D, KEY_RIGHT])
 	_add_keys("jump", [KEY_SPACE, KEY_W, KEY_UP])
 	_add_keys("interact", [KEY_E, KEY_S, KEY_DOWN, KEY_ENTER, KEY_KP_ENTER])
+	_add_keys("attack", [KEY_J, KEY_F])
+	_add_keys("throw", [KEY_K])
 	_add_keys("restart", [KEY_R])
-	# Controller: A = jump, X = pick a door, left stick / d-pad = move
+	var mouse := InputEventMouseButton.new()
+	mouse.button_index = MOUSE_BUTTON_LEFT
+	InputMap.action_add_event("attack", mouse)
+	# Controller: A = jump, X = pick a door, B = attack, Y = throw, stick / d-pad = move
 	_add_joy_button("jump", JOY_BUTTON_A)
 	_add_joy_button("interact", JOY_BUTTON_X)
 	_add_joy_button("interact", JOY_BUTTON_DPAD_DOWN)
+	_add_joy_button("attack", JOY_BUTTON_B)
+	_add_joy_button("throw", JOY_BUTTON_Y)
 	_add_joy_button("move_left", JOY_BUTTON_DPAD_LEFT)
 	_add_joy_button("move_right", JOY_BUTTON_DPAD_RIGHT)
 	for pair in [["move_left", -1.0], ["move_right", 1.0]]:
@@ -135,347 +140,136 @@ func _add_joy_button(action: String, button: JoyButton) -> void:
 	InputMap.action_add_event(action, ev)
 
 
-# ---------------------------------------------------------------- world
+# ================================================================ run flow
 
-func _build_world() -> void:
-	var last_x := FIRST_STATION_X + (STATION_COUNT - 1) * STATION_SPACING
-	level_end_x = last_x + 1100.0
-
-	_add_block(Rect2(-200, FLOOR_Y, level_end_x + 800, 300), Color(0.35, 0.25, 0.15))
-	_add_block(Rect2(-200, FLOOR_Y, level_end_x + 800, 16), Color(0.3, 0.75, 0.3))
-	_add_block(Rect2(-100, FLOOR_Y - 900, 100, 900), Color(0.3, 0.3, 0.35))
-	_add_block(Rect2(level_end_x + 300, FLOOR_Y - 900, 100, 900), Color(0.3, 0.3, 0.35))
-
-	# Running sections: hurdles, gems and enemies (kept away from the gates)
-	_add_hurdle(650.0)
-	_add_enemy(720.0, 980.0)
-	for i in STATION_COUNT:
-		var x := FIRST_STATION_X + i * STATION_SPACING
-		stations.append(_build_station(x))
-		_add_hurdle(x + 550.0)
-		if i < STATION_COUNT - 1:
-			_add_hurdle(x + 1000.0)
-			for g in 3:
-				_add_gem(Vector2(x + 720.0 + g * 60.0, FLOOR_Y - 40.0))
-			_add_enemy(x + 610.0, x + 960.0)
-			_add_enemy(x + 1060.0, x + 1350.0)
-		else:
-			_add_enemy(x + 610.0, x + 1050.0)
-
-	_add_rect(Rect2(level_end_x, FLOOR_Y - 300, 12, 300), Color.WHITE)
-	_add_rect(Rect2(level_end_x + 12, FLOOR_Y - 300, 90, 60), Color(1, 0.85, 0.1))
-	_add_world_label("GOAL", Vector2(level_end_x - 194, FLOOR_Y - 360), 40)
-	_add_world_label("START", Vector2(START_X - 200, FLOOR_Y - 200), 32)
+func _show_crafting() -> void:
+	state = "crafting"
+	RenderingServer.set_default_clear_color(Color(0.12, 0.1, 0.08))
+	_set_game_hud_visible(false)
+	craft_root.visible = true
+	_refresh_crafting(-1)
 
 
-func _add_hurdle(x: float) -> void:
-	var h := randf_range(40.0, 90.0)
-	_add_block(Rect2(x - 30, FLOOR_Y - h, 60, h), Color(0.6, 0.45, 0.3))
-	_add_gem(Vector2(x, FLOOR_Y - h - 60.0))
+func _start_stage() -> void:
+	craft_root.visible = false
+	_remove_stage()
+	var biome := Biomes.get_biome(run_biomes[stage_index])
+	stage = StageScript.new()
+	stage.setup(self, biome)
+	add_child(stage)
+	stage.goal_reached.connect(_on_goal)
+	hp = MAX_HP
+	shield_max = inventory.shield_max()
+	shield = shield_max
+	invuln = 0.0
+	combo = 0
+	stage.player.set_combo(combo)
+	for st in stage.stations:
+		_assign_problem(st, level)
+	state = "playing"
+	_set_game_hud_visible(true)
+	results_label.visible = false
+	results_bg.visible = false
+	_update_hearts()
+	update_inventory_hud()
+	_show_feedback("Stage %d of %d: %s\n%s" % [stage_index + 1, STAGES_PER_RUN, biome["name"], biome["quirk"]], 4.0)
 
 
-func _add_gem(pos: Vector2) -> void:
-	var gem := ColorRect.new()
-	gem.size = Vector2(18, 18)
-	gem.pivot_offset = Vector2(9, 9)
-	gem.position = pos - Vector2(9, 9)
-	gem.rotation = PI / 4
-	gem.color = Color(1, 0.9, 0.2)
-	add_child(gem)
-	gems.append({"node": gem, "pos": pos, "taken": false})
+func _remove_stage() -> void:
+	if stage != null:
+		stage.queue_free()
+		stage = null
+	door_marker.visible = false
 
 
-## A harmless blob that patrols back and forth. It never hurts you.
-func _add_enemy(min_x: float, max_x: float) -> void:
-	var node := Node2D.new()
-	var body := ColorRect.new()
-	body.size = ENEMY_SIZE
-	body.position = Vector2(-ENEMY_SIZE.x / 2, -ENEMY_SIZE.y)  # origin at the feet
-	body.color = ENEMY_COLOR
-	node.add_child(body)
-	for ex in [-12.0, 4.0]:
-		var eye := ColorRect.new()
-		eye.size = Vector2(8, 10)
-		eye.position = Vector2(ex, -26)
-		eye.color = Color.WHITE
-		node.add_child(eye)
-		var pupil := ColorRect.new()
-		pupil.size = Vector2(4, 5)
-		pupil.position = Vector2(ex + 2, -22)
-		pupil.color = Color.BLACK
-		node.add_child(pupil)
-	add_child(node)
-	var e := {"node": node, "min_x": min_x, "max_x": max_x, "x": 0.0, "dir": 1.0,
-		"speed": 0.0, "alive": true}
-	_reset_enemy(e)
-	enemies.append(e)
+func _on_goal() -> void:
+	if state != "playing":
+		return
+	if stage_index < STAGES_PER_RUN - 1:
+		state = "transition"
+		inventory.save()
+		_show_feedback("STAGE CLEAR!", 2.0)
+		get_tree().create_timer(2.0).timeout.connect(_after_stage_clear)
+	else:
+		_start_escape()
 
 
-func _reset_enemy(e: Dictionary) -> void:
-	e["x"] = randf_range(e["min_x"], e["max_x"])
-	e["dir"] = 1.0 if randf() < 0.5 else -1.0
-	e["speed"] = randf_range(50.0, 90.0)
-	e["alive"] = true
-	var node: Node2D = e["node"]
-	node.position = Vector2(e["x"], FLOOR_Y)
-	node.scale = Vector2.ONE
-	node.modulate = Color.WHITE
-	node.visible = true
+func _after_stage_clear() -> void:
+	stage_index += 1
+	_remove_stage()
+	_show_crafting()
 
 
-func _update_enemies(delta: float) -> void:
-	var p: Vector2 = player.global_position
-	var feet_y := p.y + 24.0
-	var on_floor: bool = player.is_on_floor()
-	if on_floor:
-		stomp_chain = 0
-
-	for e in enemies:
-		if not e["alive"]:
-			continue
-		# Patrol
-		e["x"] += e["dir"] * e["speed"] * delta
-		if e["x"] < e["min_x"] or e["x"] > e["max_x"]:
-			e["dir"] *= -1.0
-			e["x"] = clampf(e["x"], e["min_x"], e["max_x"])
-		e["node"].position.x = e["x"]
-
-		# Touching the player? (player box is 32 x 48, centered)
-		var ex: float = e["x"]
-		var top := FLOOR_Y - ENEMY_SIZE.y
-		var overlap_x := absf(p.x - ex) < (16.0 + ENEMY_SIZE.x / 2)
-		var overlap_y := feet_y > top and p.y - 24.0 < FLOOR_Y
-		if not (overlap_x and overlap_y):
-			continue
-
-		var vel: Vector2 = player.velocity
-		if vel.y > 0.0 and prev_feet_y <= top + 12.0:
-			# Stomp! Bounce higher if jump is held.
-			stomp_chain += 1
-			var pts := STOMP_POINTS * stomp_chain
-			player.velocity.y = STOMP_BOUNCE_HELD if Input.is_action_pressed("jump") else STOMP_BOUNCE
-			_defeat_enemy(e, pts, "+%d" % pts if stomp_chain == 1 else "+%d  x%d!" % [pts, stomp_chain])
-		elif absf(vel.x) >= MACH_SPEED:
-			_defeat_enemy(e, MACH_POINTS, "MACH! +%d" % MACH_POINTS)
-		else:
-			# Harmless bump: the enemy just turns around.
-			e["dir"] = signf(ex - p.x) if ex != p.x else -e["dir"]
-
-	prev_feet_y = feet_y
+func _out_of_hearts() -> void:
+	state = "transition"
+	_show_feedback("Out of hearts! Restarting this stage...", 2.0)
+	get_tree().create_timer(2.0).timeout.connect(_start_stage)
 
 
-func _defeat_enemy(e: Dictionary, points: int, text: String) -> void:
-	e["alive"] = false
+func _start_escape() -> void:
+	state = "escape"
+	escape_left = ESCAPE_TIME
+	RenderingServer.set_default_clear_color(Color(stage.biome["sky"]).lerp(Color(0.9, 0.2, 0.15), 0.45))
+	for st in stage.stations:
+		_assign_problem(st, 0)  # quicker problems for the race back
+		st["barrier"] = stage.make_barrier(float(st["x"]) - StageScript.BARRIER_OFFSET)
+	stage.reset_enemies()
+	_show_feedback("MATH TIME!  Race back to the START!\nThe clock stops while you're at a gate, so take your time on the math.", 5.0)
+
+
+# ================================================================ things the stage calls
+
+func add_score(points: int) -> void:
+	score += points
+
+
+func on_enemy_defeated(points: int) -> void:
 	score += points
 	enemies_defeated += 1
-	var node: Node2D = e["node"]
-	var tw := create_tween()
-	tw.tween_property(node, "scale", Vector2(1.3, 0.25), 0.08)
-	tw.tween_property(node, "modulate:a", 0.0, 0.3)
-	tw.tween_callback(func(): node.visible = false)
-	_popup_text(text, Vector2(e["x"], FLOOR_Y - 70.0))
 
 
-## Floating score text that rises and fades.
-func _popup_text(text: String, pos: Vector2) -> void:
-	var lbl := Label.new()
-	lbl.text = text
-	lbl.size = Vector2(200, 40)
-	lbl.position = pos - Vector2(100, 20)
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_style_label(lbl, 28)
-	lbl.add_theme_color_override("font_color", Color(1, 0.9, 0.3))
-	add_child(lbl)
-	var tw := create_tween().set_parallel(true)
-	tw.tween_property(lbl, "position:y", lbl.position.y - 60.0, 0.8)
-	tw.tween_property(lbl, "modulate:a", 0.0, 0.8).set_delay(0.3)
-	tw.chain().tween_callback(lbl.queue_free)
+func add_material(m: String, n: int) -> void:
+	inventory.mats[m] = int(inventory.mats[m]) + n
+	run_mats[m] = int(run_mats[m]) + n
+	update_inventory_hud()
 
 
-func _build_station(x: float) -> Dictionary:
-	var doors: Array = []
-	var labels: Array = []
-	for i in 3:
-		var dx := x + (i - 1) * DOOR_SPACING
-		var door := _add_rect(Rect2(dx - DOOR_WIDTH / 2, FLOOR_Y - DOOR_HEIGHT, DOOR_WIDTH, DOOR_HEIGHT), DOOR_COLOR)
-		var lbl := Label.new()
-		lbl.size = Vector2(DOOR_WIDTH, 56)
-		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		_style_label(lbl, 26)
-		door.add_child(lbl)
-		doors.append(door)
-		labels.append(lbl)
-	var sign := _add_world_label("", Vector2(x - 200, FLOOR_Y - DOOR_HEIGHT - 80), 36)
-	var st := {"x": x, "problem": null, "resolved": false, "doors": doors, "labels": labels,
-		"locked": [false, false, false], "misses": 0, "barrier": null, "sign": sign, "arrived": -1.0}
-	st["barrier"] = _make_barrier(x + BARRIER_OFFSET)
-	return st
+func hazard_hit(hazard_name: String) -> void:
+	if invuln > 0.0 or not is_playing():
+		return
+	invuln = 1.5
+	combo = 0
+	stage.player.set_combo(combo)
+	stage.player.blink(1.5)
+	var dmg := HAZARD_DAMAGE
+	var absorbed := mini(shield, dmg)
+	shield -= absorbed
+	dmg -= absorbed
+	hp -= dmg
+	_update_hearts()
+	if hp <= 0:
+		_out_of_hearts()
+		return
+	if absorbed > 0:
+		_show_feedback("%s! Your armor took the hit." % hazard_name, 2.5)
+	else:
+		_show_feedback("Ouch! %s! You lost a heart." % hazard_name, 2.5)
 
 
-func _make_barrier(x: float) -> StaticBody2D:
-	var rect := Rect2(x - 15, FLOOR_Y - 420, 30, 420)
-	var body := StaticBody2D.new()
-	body.position = rect.position + rect.size / 2
-	var col := CollisionShape2D.new()
-	var shape := RectangleShape2D.new()
-	shape.size = rect.size
-	col.shape = shape
-	body.add_child(col)
-	var vis := ColorRect.new()
-	vis.size = rect.size
-	vis.position = -rect.size / 2
-	vis.color = BARRIER_COLOR
-	body.add_child(vis)
-	add_child(body)
-	return body
-
-
-func _assign_problem(st: Dictionary, lvl: int) -> void:
-	var p := DivisionProblem.make(lvl)
-	st["problem"] = p
-	st["resolved"] = false
-	st["locked"] = [false, false, false]
-	st["misses"] = 0
-	st["arrived"] = -1.0
-	st["sign"].text = p.question_text()
-	for i in 3:
-		st["doors"][i].color = DOOR_COLOR
-		st["labels"][i].text = p.choices[i]["text"]
-
-
-func _add_block(rect: Rect2, color: Color) -> void:
-	var body := StaticBody2D.new()
-	body.position = rect.position + rect.size / 2
-	var col := CollisionShape2D.new()
-	var shape := RectangleShape2D.new()
-	shape.size = rect.size
-	col.shape = shape
-	body.add_child(col)
-	var vis := ColorRect.new()
-	vis.size = rect.size
-	vis.position = -rect.size / 2
-	vis.color = color
-	body.add_child(vis)
-	add_child(body)
-
-
-func _add_rect(rect: Rect2, color: Color) -> ColorRect:
-	var r := ColorRect.new()
-	r.position = rect.position
-	r.size = rect.size
-	r.color = color
-	add_child(r)
-	return r
-
-
-func _add_world_label(text: String, pos: Vector2, font_size: int) -> Label:
-	var lbl := Label.new()
-	lbl.text = text
-	lbl.position = pos
-	lbl.size = Vector2(400, 50)
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_style_label(lbl, font_size)
-	add_child(lbl)
-	return lbl
-
-
-func _spawn_player() -> void:
-	door_marker = _add_rect(Rect2(0, 0, DOOR_WIDTH, 8), Color.WHITE)
-	door_marker.visible = false
-	player = PlayerScript.new()
-	player.position = Vector2(START_X, FLOOR_Y - 24)
-	add_child(player)
-	var cam := Camera2D.new()
-	cam.offset = Vector2(200, -120)
-	cam.position_smoothing_enabled = true
-	cam.limit_bottom = int(FLOOR_Y + 150)
-	cam.limit_left = -100
-	player.add_child(cam)
-	cam.make_current()
-
-
-# ---------------------------------------------------------------- HUD
-
-func _build_hud() -> void:
-	var hud := CanvasLayer.new()
-	add_child(hud)
-	problem_label = _hud_label(hud, Vector2(0, 16), 44)
-
-	feedback_bg = ColorRect.new()
-	feedback_bg.color = Color(0, 0, 0, 0.6)
-	feedback_bg.position = Vector2(140, 84)
-	feedback_bg.size = Vector2(1000, 110)
-	feedback_bg.visible = false
-	hud.add_child(feedback_bg)
-	feedback_label = _hud_label(hud, Vector2(160, 90), 26)
-	feedback_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	feedback_label.size = Vector2(960, 100)
-	feedback_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-
-	stats_label = _hud_label(hud, Vector2(20, 16), 24)
-	stats_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	stats_label.size = Vector2(300, 100)
-	timer_label = _hud_label(hud, Vector2(860, 16), 32)
-	timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	timer_label.size = Vector2(400, 100)
-	prompt_label = _hud_label(hud, Vector2(0, 620), 30)
-
-	var help := _hud_label(hud, Vector2(0, 680), 18)
-	help.text = "Move: A/D or arrows     Jump: Space     Pick a door: E (or Down)     Restart: R"
-
-	results_bg = ColorRect.new()
-	results_bg.color = Color(0, 0, 0, 0.7)
-	results_bg.position = Vector2(190, 120)
-	results_bg.size = Vector2(900, 500)
-	results_bg.visible = false
-	hud.add_child(results_bg)
-	results_label = _hud_label(hud, Vector2(190, 140), 30)
-	results_label.size = Vector2(900, 460)
-	results_label.visible = false
-
-
-func _hud_label(parent: Node, pos: Vector2, font_size: int) -> Label:
-	var lbl := Label.new()
-	lbl.position = pos
-	lbl.size = Vector2(1280, 60)
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_style_label(lbl, font_size)
-	parent.add_child(lbl)
-	return lbl
-
-
-func _style_label(lbl: Label, font_size: int) -> void:
-	lbl.add_theme_font_size_override("font_size", font_size)
-	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
-	lbl.add_theme_constant_override("outline_size", 6)
-
-
-## seconds < 0 keeps the message up until the gate is solved.
-func _show_feedback(text: String, seconds := 3.0) -> void:
-	feedback_label.text = text
-	feedback_bg.visible = text != ""
-	feedback_left = seconds
-
-
-func _clear_feedback() -> void:
-	feedback_label.text = ""
-	feedback_bg.visible = false
-	feedback_left = 0.0
-
-
-# ---------------------------------------------------------------- game loop
+# ================================================================ game loop
 
 func _physics_process(delta: float) -> void:
-	if Input.is_action_just_pressed("restart"):
+	if Input.is_action_just_pressed("restart") and state != "crafting":
+		inventory.save()
 		get_tree().reload_current_scene()
 		return
-	if finished:
+	if invuln > 0.0:
+		invuln -= delta
+	_tick_feedback(delta)
+	if not is_playing():
 		return
 	clock += delta
 
-	_collect_gems()
-	_update_enemies(delta)
 	var zone_station = _zone_station()
 	if zone_station != null and zone_station["arrived"] < 0.0:
 		zone_station["arrived"] = clock
@@ -485,49 +279,40 @@ func _physics_process(delta: float) -> void:
 	if door >= 0 and Input.is_action_just_pressed("interact"):
 		_pick(zone_station, door)
 
-	if not escaping and player.global_position.x >= level_end_x:
-		_start_escape()
-	elif escaping:
+	if state == "escape":
 		if zone_station == null:
 			escape_left -= delta  # the clock only runs while you're running
-		if player.global_position.x <= START_X + 50:
+		if stage.player.global_position.x <= StageScript.START_X + 50.0:
 			_finish(true)
+			return
 		elif escape_left <= 0.0:
 			_finish(false)
+			return
 
-	_update_hud(delta, zone_station)
-
-
-func _collect_gems() -> void:
-	var p: Vector2 = player.global_position
-	for g in gems:
-		if not g["taken"] and p.distance_to(g["pos"]) < 34.0:
-			g["taken"] = true
-			g["node"].visible = false
-			score += 10
+	_update_hud(zone_station)
 
 
 ## The unsolved gate you're standing near, or null.
 func _zone_station():
-	var x: float = player.global_position.x
-	for st in stations:
+	var x: float = stage.player.global_position.x
+	for st in stage.stations:
 		if st["resolved"]:
 			continue
 		var sx: float = st["x"]
-		if not escaping and x > sx - ZONE_REACH and x < sx + BARRIER_OFFSET:
+		if state == "playing" and x > sx - StageScript.ZONE_REACH and x < sx + StageScript.BARRIER_OFFSET:
 			return st
-		if escaping and x < sx + ZONE_REACH and x > sx - BARRIER_OFFSET:
+		if state == "escape" and x < sx + StageScript.ZONE_REACH and x > sx - StageScript.BARRIER_OFFSET:
 			return st
 	return null
 
 
 func _door_under_player(st) -> int:
-	if st == null or not player.is_on_floor():
+	if st == null or not stage.player.is_on_floor():
 		return -1
-	var x: float = player.global_position.x
+	var x: float = stage.player.global_position.x
 	for i in 3:
-		var dx: float = st["x"] + (i - 1) * DOOR_SPACING
-		if absf(x - dx) < DOOR_WIDTH / 2:
+		var dx: float = st["x"] + (i - 1) * StageScript.DOOR_SPACING
+		if absf(x - dx) < StageScript.DOOR_WIDTH / 2.0:
 			return i
 	return -1
 
@@ -541,13 +326,26 @@ func _update_door_hover(st, door: int) -> void:
 			if revealed:
 				st["doors"][i].color = REVEAL_COLOR
 			else:
-				st["doors"][i].color = DOOR_HOVER_COLOR if i == door else DOOR_COLOR
+				st["doors"][i].color = DOOR_HOVER_COLOR if i == door else StageScript.DOOR_COLOR
 	if door >= 0:
-		var dx: float = st["x"] + (door - 1) * DOOR_SPACING
-		door_marker.position = Vector2(dx - DOOR_WIDTH / 2, FLOOR_Y - DOOR_HEIGHT - 16)
+		var dx: float = st["x"] + (door - 1) * StageScript.DOOR_SPACING
+		door_marker.position = Vector2(dx - StageScript.DOOR_WIDTH / 2.0, StageScript.FLOOR_Y - StageScript.DOOR_HEIGHT - 16.0)
 		door_marker.visible = true
 	else:
 		door_marker.visible = false
+
+
+func _assign_problem(st: Dictionary, lvl: int) -> void:
+	var p := DivisionProblem.make(lvl)
+	st["problem"] = p
+	st["resolved"] = false
+	st["locked"] = [false, false, false]
+	st["misses"] = 0
+	st["arrived"] = -1.0
+	st["sign"].text = p.question_text()
+	for i in 3:
+		st["doors"][i].color = StageScript.DOOR_COLOR
+		st["labels"][i].text = p.choices[i]["text"]
 
 
 func _pick(st: Dictionary, i: int) -> void:
@@ -555,24 +353,22 @@ func _pick(st: Dictionary, i: int) -> void:
 	if st["locked"][i]:
 		_show_feedback("You already tried that door. Pick another one!", 2.0)
 		return
-
 	if i == p.correct_index:
 		_solve(st, i)
 		return
 
-	# Wrong pick
 	var kind: String = p.choices[i]["kind"]
 	mistakes[kind] = mistakes.get(kind, 0) + 1
 	st["locked"][i] = true
 	st["doors"][i].color = WRONG_COLOR
 	st["misses"] += 1
 	combo = 0
-	player.set_combo(combo)
+	stage.player.set_combo(combo)
 	if st["misses"] == 1:
 		streak_wrong += 1
 		streak_right = 0
 		_show_feedback("Not quite! " + p.hint_for(kind) + "\nTry another door.", -1.0)
-		if not escaping and streak_wrong >= 2 and level > 1:
+		if state == "playing" and streak_wrong >= 2 and level > 1:
 			level -= 1
 			streak_wrong = 0
 			_refresh_ahead(st)
@@ -584,9 +380,9 @@ func _solve(st: Dictionary, i: int) -> void:
 	var p: DivisionProblem = st["problem"]
 	st["resolved"] = true
 	st["doors"][i].color = RIGHT_COLOR
-	if st["barrier"] != null:
+	if st["barrier"] != null and is_instance_valid(st["barrier"]):
 		st["barrier"].queue_free()
-		st["barrier"] = null
+	st["barrier"] = null
 	answered += 1
 
 	if st["misses"] == 0:
@@ -597,51 +393,38 @@ func _solve(st: Dictionary, i: int) -> void:
 		streak_right += 1
 		streak_wrong = 0
 		var msg := "Nice!  %s" % p.answer_text()
-		if clock - st["arrived"] <= QUICK_BONUS_SECONDS:
+		if clock - float(st["arrived"]) <= QUICK_BONUS_SECONDS:
 			score += 50
 			msg += "    Quick thinking! +50"
 		if combo >= 3:
 			msg += "    COMBO x%d!" % combo
-		if not escaping and streak_right >= 3 and level < 3:
+		if state == "playing" and streak_right >= 3 and level < 3:
 			level += 1
 			streak_right = 0
 			msg += "    LEVEL UP!"
 			_refresh_ahead(st)
 		_show_feedback(msg, 3.0)
-		player.boost()
+		stage.player.boost()
 	else:
 		score += 25
 		_show_feedback("You got it!  %s" % p.answer_text(), 3.0)
-	player.set_combo(combo)
+	stage.player.set_combo(combo)
 
 
 ## When difficulty changes, give the gates still ahead new problems.
 func _refresh_ahead(current: Dictionary) -> void:
-	for st in stations:
-		if st != current and not st["resolved"]:
+	for st in stage.stations:
+		if st["x"] != current["x"] and not st["resolved"]:
 			_assign_problem(st, level)
 
 
-func _start_escape() -> void:
-	escaping = true
-	escape_left = ESCAPE_TIME
-	RenderingServer.set_default_clear_color(ESCAPE_SKY)
-	for st in stations:
-		_assign_problem(st, 0)  # quicker problems for the race back
-		st["barrier"] = _make_barrier(st["x"] - BARRIER_OFFSET)
-	for e in enemies:
-		_reset_enemy(e)  # fresh enemies for the race back
-	_show_feedback("MATH TIME!  Race back to the START!\nThe clock stops while you're at a gate, so take your time on the math.", 5.0)
-
-
 func _finish(escaped: bool) -> void:
-	finished = true
-	player.set_physics_process(false)
+	state = "results"
+	stage.player.set_physics_process(false)
 	_clear_feedback()
-	timer_label.text = ""
-	problem_label.text = ""
-	prompt_label.text = ""
+	_set_game_hud_visible(false)
 	door_marker.visible = false
+	inventory.save()
 
 	var accuracy := float(first_try_correct) / maxf(answered, 1)
 	var time_bonus := int(escape_left) * 20 if escaped else 0
@@ -666,13 +449,18 @@ func _finish(escaped: bool) -> void:
 	lines.append("Score: %d   (time bonus %d)" % [score, time_bonus])
 	lines.append("Right on the first try: %d / %d    Best combo: x%d" % [first_try_correct, answered, best_combo])
 	lines.append("Enemies defeated: %d" % enemies_defeated)
+	var got: Array = []
+	for m in Inventory.MATERIALS:
+		if int(run_mats[m]) > 0:
+			got.append("%d %s" % [run_mats[m], m])
+	if not got.is_empty():
+		lines.append("Gathered: " + ", ".join(got))
 	if mistakes.size() > 0:
-		lines.append("")
 		lines.append("Things to practice:")
 		for kind in mistakes:
 			lines.append("  %s: %d" % [MISTAKE_NAMES.get(kind, kind), mistakes[kind]])
 	lines.append("")
-	lines.append("Press R to play again")
+	lines.append("Press R to play again (your gear is saved)")
 	results_label.text = "\n".join(lines)
 	results_label.visible = true
 	results_bg.visible = true
@@ -702,19 +490,149 @@ func _save_progress(escaped: bool, rank: String) -> void:
 	f.close()
 
 
-func _update_hud(delta: float, zone_station) -> void:
+# ================================================================ HUD
+
+func _build_hud() -> void:
+	var hud := CanvasLayer.new()
+	add_child(hud)
+	problem_label = _hud_label(hud, Vector2(0, 16), 44)
+
+	feedback_bg = ColorRect.new()
+	feedback_bg.color = Color(0, 0, 0, 0.6)
+	feedback_bg.position = Vector2(140, 84)
+	feedback_bg.size = Vector2(1000, 110)
+	feedback_bg.visible = false
+	hud.add_child(feedback_bg)
+	feedback_label = _hud_label(hud, Vector2(160, 90), 26)
+	feedback_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	feedback_label.size = Vector2(960, 100)
+	feedback_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+
+	stats_label = _hud_label(hud, Vector2(20, 16), 24)
+	stats_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	stats_label.size = Vector2(300, 100)
+	hearts_box = HBoxContainer.new()
+	hearts_box.position = Vector2(20, 112)
+	hearts_box.add_theme_constant_override("separation", 4)
+	hud.add_child(hearts_box)
+	timer_label = _hud_label(hud, Vector2(860, 16), 32)
+	timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	timer_label.size = Vector2(400, 100)
+	prompt_label = _hud_label(hud, Vector2(0, 590), 30)
+	inv_label = _hud_label(hud, Vector2(20, 645), 20)
+	inv_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	help_label = _hud_label(hud, Vector2(0, 685), 17)
+	help_label.text = "Move: A/D   Jump: Space   Pick door: E   Attack: J or click (hold to throw)   Throw: K   Restart: R"
+
+	results_bg = ColorRect.new()
+	results_bg.color = Color(0, 0, 0, 0.75)
+	results_bg.position = Vector2(190, 70)
+	results_bg.size = Vector2(900, 580)
+	results_bg.visible = false
+	hud.add_child(results_bg)
+	results_label = _hud_label(hud, Vector2(190, 90), 28)
+	results_label.size = Vector2(900, 540)
+	results_label.visible = false
+
+	door_marker = ColorRect.new()
+	door_marker.size = Vector2(StageScript.DOOR_WIDTH, 8)
+	door_marker.color = Color.WHITE
+	door_marker.z_index = 3
+	door_marker.visible = false
+	add_child(door_marker)
+
+	_build_crafting(hud)
+
+
+func _set_game_hud_visible(v: bool) -> void:
+	for n in [problem_label, stats_label, timer_label, prompt_label, inv_label, help_label, hearts_box]:
+		n.visible = v
+	if not v:
+		_clear_feedback()
+
+
+func _hud_label(parent: Node, pos: Vector2, font_size: int) -> Label:
+	var lbl := Label.new()
+	lbl.position = pos
+	lbl.size = Vector2(1280, 60)
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	style_label(lbl, font_size)
+	parent.add_child(lbl)
+	return lbl
+
+
+func style_label(lbl: Label, font_size: int) -> void:
+	lbl.add_theme_font_size_override("font_size", font_size)
+	lbl.add_theme_color_override("font_outline_color", Color.BLACK)
+	lbl.add_theme_constant_override("outline_size", 6)
+
+
+## seconds < 0 keeps the message up until the gate is solved.
+func _show_feedback(text: String, seconds := 3.0) -> void:
+	feedback_label.text = text
+	feedback_bg.visible = text != ""
+	feedback_left = seconds
+
+
+func _clear_feedback() -> void:
+	feedback_label.text = ""
+	feedback_bg.visible = false
+	feedback_left = 0.0
+
+
+func _tick_feedback(delta: float) -> void:
+	if feedback_left > 0.0:
+		feedback_left -= delta
+		if feedback_left <= 0.0:
+			_clear_feedback()
+
+
+func _update_hearts() -> void:
+	for c in hearts_box.get_children():
+		hearts_box.remove_child(c)
+		c.queue_free()
+	for i in MAX_HP / 2:
+		hearts_box.add_child(_heart_icon(clampi(hp - i * 2, 0, 2), Color(0.9, 0.15, 0.2)))
+	for i in ceili(shield_max / 2.0):
+		hearts_box.add_child(_heart_icon(clampi(shield - i * 2, 0, 2), Color(0.3, 0.6, 1.0)))
+
+
+## A simple square heart: fill 2 = full, 1 = half, 0 = empty.
+func _heart_icon(fill: int, color: Color) -> Control:
+	var c := Control.new()
+	c.custom_minimum_size = Vector2(24, 24)
+	var bg := ColorRect.new()
+	bg.size = Vector2(22, 22)
+	bg.color = Color(0.1, 0.05, 0.05, 0.8)
+	c.add_child(bg)
+	if fill > 0:
+		var f := ColorRect.new()
+		f.size = Vector2(22.0 if fill >= 2 else 11.0, 22.0)
+		f.color = color
+		c.add_child(f)
+	return c
+
+
+func update_inventory_hud() -> void:
+	var parts: Array = []
+	for m in Inventory.MATERIALS:
+		parts.append("%s %d" % [m.capitalize(), inventory.mats[m]])
+	inv_label.text = "   ".join(parts) + "      Daggers %d/%d" % [inventory.daggers, Inventory.MAX_DAGGERS]
+
+
+func _update_hud(zone_station) -> void:
 	# Show the next gate's problem early so he can start thinking while running
 	var next = zone_station
 	if next == null:
-		for st in stations:
+		for st in stage.stations:
 			if st["resolved"]:
 				continue
-			if next == null or (escaping and st["x"] > next["x"]):
+			if next == null or (state == "escape" and st["x"] > next["x"]):
 				next = st
 	if next != null:
 		problem_label.text = next["problem"].question_text()
 	else:
-		problem_label.text = "RUN BACK TO THE START!" if escaping else "Head for the GOAL!"
+		problem_label.text = "RUN BACK TO THE START!" if state == "escape" else "Head for the GOAL!"
 
 	var door := _door_under_player(zone_station)
 	if door >= 0 and not zone_station["locked"][door]:
@@ -723,14 +641,100 @@ func _update_hud(delta: float, zone_station) -> void:
 		prompt_label.text = ""
 
 	stats_label.text = "Score: %d\nCombo: x%d\nLevel: %d" % [score, combo, level]
-	if escaping:
+	if state == "escape":
 		timer_label.text = "TIME: %d" % ceili(escape_left)
 		if zone_station != null:
 			timer_label.text += "\n(paused)"
 	else:
-		timer_label.text = ""
+		timer_label.text = "Stage %d/%d" % [stage_index + 1, STAGES_PER_RUN]
 
-	if feedback_left > 0.0:
-		feedback_left -= delta
-		if feedback_left <= 0.0:
-			_clear_feedback()
+
+# ================================================================ crafting screen
+
+func _build_crafting(hud: CanvasLayer) -> void:
+	craft_root = ColorRect.new()
+	craft_root.color = Color(0.1, 0.08, 0.06, 0.95)
+	craft_root.size = Vector2(1280, 720)
+	hud.add_child(craft_root)
+	var box := VBoxContainer.new()
+	box.position = Vector2(90, 16)
+	box.size = Vector2(1100, 690)
+	box.add_theme_constant_override("separation", 8)
+	craft_root.add_child(box)
+	var title := _plain_label(box, 40)
+	title.text = "Crafting Table"
+	craft_next = _plain_label(box, 24)
+	craft_inv = _plain_label(box, 22)
+	craft_gear = _plain_label(box, 20)
+	craft_grid = GridContainer.new()
+	craft_grid.columns = 3
+	craft_grid.add_theme_constant_override("h_separation", 8)
+	craft_grid.add_theme_constant_override("v_separation", 6)
+	craft_grid.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	box.add_child(craft_grid)
+	craft_desc = _plain_label(box, 20)
+	start_btn = Button.new()
+	start_btn.text = "START STAGE"
+	start_btn.custom_minimum_size = Vector2(320, 56)
+	start_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	start_btn.add_theme_font_size_override("font_size", 26)
+	start_btn.pressed.connect(_start_stage)
+	box.add_child(start_btn)
+
+
+func _plain_label(parent: Node, font_size: int) -> Label:
+	var lbl := Label.new()
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	style_label(lbl, font_size)
+	parent.add_child(lbl)
+	return lbl
+
+
+func _refresh_crafting(focus_index: int) -> void:
+	var biome := Biomes.get_biome(run_biomes[stage_index])
+	craft_next.text = "Next up: Stage %d of %d, %s\n%s" % [stage_index + 1, STAGES_PER_RUN, biome["name"], biome["quirk"]]
+	var parts: Array = []
+	for m in Inventory.MATERIALS:
+		parts.append("%s: %d" % [m.capitalize(), inventory.mats[m]])
+	craft_inv.text = "   ".join(parts)
+	var armor_parts: Array = []
+	for slot in inventory.armor:
+		armor_parts.append("%s %s" % [str(inventory.armor[slot]).capitalize(), slot])
+	craft_gear.text = "Pickaxe: %s    Axe: %s    Daggers: %d/%d    Armor: %s  (shield: %s hearts)" % [
+		Inventory.PICKAXE_NAMES[inventory.pickaxe], "Yes" if inventory.has_axe else "No",
+		inventory.daggers, Inventory.MAX_DAGGERS, ", ".join(armor_parts), str(inventory.shield_max() / 2.0)]
+
+	for c in craft_grid.get_children():
+		craft_grid.remove_child(c)
+		c.queue_free()
+	var buttons: Array = []
+	for i in Inventory.RECIPES.size():
+		var r: Dictionary = Inventory.RECIPES[i]
+		var status := inventory.craft_status(r)
+		var btn := Button.new()
+		btn.custom_minimum_size = Vector2(350, 60)
+		btn.add_theme_font_size_override("font_size", 17)
+		btn.text = "%s\n%s" % [r["name"], status if status != "" else inventory.cost_text(r)]
+		btn.disabled = status != ""
+		btn.pressed.connect(_on_craft.bind(i))
+		btn.focus_entered.connect(_describe.bind(i))
+		btn.mouse_entered.connect(_describe.bind(i))
+		craft_grid.add_child(btn)
+		buttons.append(btn)
+	if focus_index >= 0 and focus_index < buttons.size() and not buttons[focus_index].disabled:
+		buttons[focus_index].grab_focus()
+	else:
+		start_btn.grab_focus()
+
+
+func _describe(i: int) -> void:
+	var r: Dictionary = Inventory.RECIPES[i]
+	var status := inventory.craft_status(r)
+	craft_desc.text = "%s: %s%s" % [r["name"], r["desc"], ("   (" + status + ")") if status != "" else ""]
+
+
+func _on_craft(i: int) -> void:
+	var r: Dictionary = Inventory.RECIPES[i]
+	if inventory.craft(r):
+		_refresh_crafting(i)
+		craft_desc.text = "Crafted %s!" % r["name"]
