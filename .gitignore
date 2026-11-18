@@ -1,0 +1,4 @@
+# Godot 4
+.godot/
+export_presets.cfg
+.DS_Store
